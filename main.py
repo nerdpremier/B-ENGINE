@@ -11,7 +11,6 @@ import os
 
 app = FastAPI()
 
-# โหลด model ครั้งเดียวตอน startup
 MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_model.pkl")
 try:
     clf = joblib.load(MODEL_PATH)
@@ -20,11 +19,14 @@ except Exception as e:
 
 API_SECRET = os.getenv("RISK_API_SECRET", "change-me")
 
-# ── Normalization constants (calibrated จาก model จริง) ────────
-# offset_ = decision boundary ของ IF
-# SCORE_MOST_ANOMALOUS = empirical min จาก 50,000 random samples
-SCORE_OFFSET         = clf.offset_           # -0.5000
-SCORE_MOST_ANOMALOUS = -0.7330               # empirical min
+# ── Normalization (sigmoid + min-max) ─────────────────────────
+# 1. sigmoid(raw) = 1 / (1 + exp(raw))  → เหมือน predict.txt
+# 2. min-max normalize sigmoid ให้เป็น [0, 1]
+#    SIG_MIN = sigmoid ของ normal สุด (ค่าต่ำ)
+#    SIG_MAX = sigmoid ของ anomalous สุด (ค่าสูง)
+# empirical จาก 50,000 random samples
+SIG_MIN = 0.6291
+SIG_MAX = 0.6777
 
 
 class Stats(BaseModel):
@@ -56,13 +58,12 @@ def to_vector(b: BehaviorPayload) -> list[float]:
 
 def normalize(raw_score: float) -> float:
     """
-    Offset-based normalization:
-      score >= offset  →  0.0  (normal)
-      score <  offset  →  map [offset → most_anomalous] เป็น [0.0 → 1.0]
+    sigmoid + min-max normalization:
+      0.0 = normal สุด
+      1.0 = anomalous สุด
     """
-    if raw_score >= SCORE_OFFSET:
-        return 0.0
-    return min(1.0, (SCORE_OFFSET - raw_score) / (SCORE_OFFSET - SCORE_MOST_ANOMALOUS))
+    sig = 1.0 / (1.0 + np.exp(raw_score))
+    return float(np.clip((sig - SIG_MIN) / (SIG_MAX - SIG_MIN), 0.0, 1.0))
 
 
 @app.post("/score")
@@ -77,6 +78,7 @@ def score(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         raw = float(clf.score_samples([vec])[0])
+
     return {
         "raw_score":  round(raw, 4),
         "normalized": round(normalize(raw), 4),
@@ -87,5 +89,6 @@ def score(
 def health():
     return {
         "status":  "ok",
-        "offset":  SCORE_OFFSET,
+        "sig_min": SIG_MIN,
+        "sig_max": SIG_MAX,
     }
