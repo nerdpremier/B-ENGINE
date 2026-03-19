@@ -1,3 +1,22 @@
+"""
+Risk Engine — Isolation Forest scoring microservice
+Decision-centered normalization for streaming behavior scoring.
+
+Why this version:
+- The previous min/max or pseudo-percentile normalization still stayed high
+  because the model's raw score distribution is very compressed.
+- For IsolationForest, the real anomaly boundary is better represented by
+  decision_function(), where:
+      decision > 0  => normal side
+      decision < 0  => anomalous side
+- This service keeps normalization, but normalizes around the model boundary
+  instead of around train min/max extremes.
+
+Output meaning:
+- normalized close to 0.0 => normal behavior
+- normalized around 0.5   => near model boundary
+- normalized close to 1.0 => increasingly anomalous
+"""
 from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 import joblib
@@ -5,15 +24,15 @@ import numpy as np
 import warnings
 import os
 
-app = FastAPI(title="Risk Engine", version="3.0-percentile")
+app = FastAPI(title="Risk Engine", version="3.1-decision-normalized")
 
-MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_anomaly_score.pkl")
+MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_model.pkl")
 API_SECRET = os.getenv("RISK_API_SECRET", "change-me")
 
-
-DEFAULT_LOW_PCT = float(os.getenv("RISK_LOW_PERCENTILE", "5"))
-DEFAULT_HIGH_PCT = float(os.getenv("RISK_HIGH_PERCENTILE", "95"))
-
+# Controls how quickly normalized score rises around the model boundary.
+# Smaller value = smoother / less sensitive.
+# Larger value = steeper / more sensitive.
+RISK_SCALE = float(os.getenv("RISK_SCALE", "0.08"))
 EPS = 1e-12
 
 try:
@@ -21,7 +40,7 @@ try:
 except Exception as e:
     raise RuntimeError(f"Cannot load model at '{MODEL_PATH}': {e}")
 
-# Support both bundled dict and plain sklearn model.
+# Support both bundle-dict and direct model object
 if isinstance(loaded, dict):
     bundle = loaded
     clf = bundle["model"] if "model" in bundle else loaded
@@ -33,38 +52,7 @@ FEATURE_COLS = bundle.get("feature_cols") if isinstance(bundle, dict) else None
 TRAIN_SCORE_MIN = float(bundle.get("train_score_min", -0.6667140844647449))
 TRAIN_SCORE_MAX = float(bundle.get("train_score_max", -0.40973622752350913))
 TRAIN_SCORE_RANGE = float(bundle.get("train_score_range", TRAIN_SCORE_MAX - TRAIN_SCORE_MIN))
-
-# Read real percentiles if present in model bundle.
-BUNDLE_P05 = bundle.get("train_score_p05")
-BUNDLE_P50 = bundle.get("train_score_p50")
-BUNDLE_P95 = bundle.get("train_score_p95")
-
-
-def _inner_anchor_from_minmax(min_score: float, max_score: float, pct: float) -> float:
-    pct = max(0.0, min(100.0, pct)) / 100.0
-    return float(min_score + (max_score - min_score) * pct)
-
-
-def resolve_percentile_anchors() -> tuple[float, float, str]:
-    if BUNDLE_P05 is not None and BUNDLE_P95 is not None:
-        low_anchor = float(BUNDLE_P05)
-        high_anchor = float(BUNDLE_P95)
-        mode = "true_percentile_from_bundle"
-    else:
-        low_anchor = _inner_anchor_from_minmax(TRAIN_SCORE_MIN, TRAIN_SCORE_MAX, DEFAULT_LOW_PCT)
-        high_anchor = _inner_anchor_from_minmax(TRAIN_SCORE_MIN, TRAIN_SCORE_MAX, DEFAULT_HIGH_PCT)
-        mode = "trimmed_range_fallback"
-
-    # Safety correction if anchors are reversed or collapsed.
-    if high_anchor <= low_anchor:
-        low_anchor = TRAIN_SCORE_MIN + 0.10 * TRAIN_SCORE_RANGE
-        high_anchor = TRAIN_SCORE_MAX - 0.10 * TRAIN_SCORE_RANGE
-        mode = f"{mode}_auto_corrected"
-
-    return float(low_anchor), float(high_anchor), mode
-
-
-LOW_ANCHOR, HIGH_ANCHOR, NORMALIZATION_MODE = resolve_percentile_anchors()
+MODEL_OFFSET = float(getattr(clf, "offset_", np.nan)) if hasattr(clf, "offset_") else np.nan
 
 
 class Stats(BaseModel):
@@ -101,12 +89,27 @@ def to_vector(b: BehaviorPayload) -> list[float]:
     return vec
 
 
-def normalize(raw_score: float) -> float:
-    denom = HIGH_ANCHOR - LOW_ANCHOR
-    if denom <= EPS:
-        return 0.0
+def normalize_from_decision(decision: float) -> float:
+    """
+    Convert decision_function output into [0, 1] risk score.
 
-    risk = (HIGH_ANCHOR - raw_score) / denom
+    decision_function meaning in IsolationForest:
+      decision > 0  => normal
+      decision = 0  => model boundary
+      decision < 0  => anomaly side
+
+    We map it with a sigmoid centered at 0 and flipped so that:
+      - strongly positive decision => near 0
+      - near zero                 => around 0.5
+      - strongly negative         => near 1
+
+    Formula:
+      risk = 1 / (1 + exp(decision / scale))
+
+    scale is configurable via RISK_SCALE.
+    """
+    scale = max(RISK_SCALE, EPS)
+    risk = 1.0 / (1.0 + np.exp(decision / scale))
     return float(np.clip(risk, 0.0, 1.0))
 
 
@@ -127,10 +130,8 @@ def score(
     return {
         "raw_score": round(raw, 6),
         "decision": round(decision, 6),
-        "normalized": round(normalize(raw), 6),
-        "normalization_mode": NORMALIZATION_MODE,
-        "low_anchor": round(LOW_ANCHOR, 6),
-        "high_anchor": round(HIGH_ANCHOR, 6),
+        "normalized": round(normalize_from_decision(decision), 6),
+        "risk_scale": RISK_SCALE,
     }
 
 
@@ -144,12 +145,7 @@ def health():
         "train_score_min": round(TRAIN_SCORE_MIN, 6),
         "train_score_max": round(TRAIN_SCORE_MAX, 6),
         "train_score_range": round(TRAIN_SCORE_RANGE, 6),
-        "bundle_train_score_p05": None if BUNDLE_P05 is None else round(float(BUNDLE_P05), 6),
-        "bundle_train_score_p50": None if BUNDLE_P50 is None else round(float(BUNDLE_P50), 6),
-        "bundle_train_score_p95": None if BUNDLE_P95 is None else round(float(BUNDLE_P95), 6),
-        "normalization_mode": NORMALIZATION_MODE,
-        "low_anchor": round(LOW_ANCHOR, 6),
-        "high_anchor": round(HIGH_ANCHOR, 6),
-        "low_percentile": DEFAULT_LOW_PCT,
-        "high_percentile": DEFAULT_HIGH_PCT,
+        "model_offset": None if np.isnan(MODEL_OFFSET) else round(MODEL_OFFSET, 6),
+        "risk_scale": RISK_SCALE,
+        "normalization_mode": "decision_sigmoid_centered_at_zero",
     }
