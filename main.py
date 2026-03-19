@@ -13,20 +13,15 @@ app = FastAPI()
 
 MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_model.pkl")
 try:
-    clf = joblib.load(MODEL_PATH)
+    bundle = joblib.load(MODEL_PATH)
+    clf = bundle["model"] if isinstance(bundle, dict) else bundle
 except Exception as e:
     raise RuntimeError(f"Cannot load model at '{MODEL_PATH}': {e}")
 
 API_SECRET = os.getenv("RISK_API_SECRET", "change-me")
 
-# ── Normalization (sigmoid + min-max) ─────────────────────────
-# 1. sigmoid(raw) = 1 / (1 + exp(raw))  → เหมือน predict.txt
-# 2. min-max normalize sigmoid ให้เป็น [0, 1]
-#    SIG_MIN = sigmoid ของ normal สุด (ค่าต่ำ)
-#    SIG_MAX = sigmoid ของ anomalous สุด (ค่าสูง)
-# empirical จาก 50,000 random samples
-SIG_MIN = 0.6021358173246466
-SIG_MAX = 0.6439281474527869
+SIG_MIN = 0.6021
+SIG_MAX = 0.6439
 
 
 class Stats(BaseModel):
@@ -34,34 +29,29 @@ class Stats(BaseModel):
     s: float = Field(ge=0, le=1)
 
 class Features(BaseModel):
-    density:    float = Field(ge=0, le=1)
+    density: float = Field(ge=0, le=1)
     idle_ratio: float = Field(ge=0, le=1)
 
 class BehaviorPayload(BaseModel):
-    mouse:    Stats
-    click:    Stats
-    key:      Stats
-    idle:     Stats
+    mouse: Stats
+    click: Stats
+    key: Stats
+    idle: Stats
     features: Features
 
 
 def to_vector(b: BehaviorPayload) -> list[float]:
     return [
-        b.mouse.m,    b.mouse.s,
-        b.click.m,    b.click.s,
-        b.key.m,      b.key.s,
-        b.idle.m,     b.idle.s,
+        b.mouse.m, b.mouse.s,
+        b.click.m, b.click.s,
+        b.key.m, b.key.s,
+        b.idle.m, b.idle.s,
         b.features.density,
         b.features.idle_ratio,
     ]
 
 
 def normalize(raw_score: float) -> float:
-    """
-    sigmoid + min-max normalization:
-      0.0 = normal สุด
-      1.0 = anomalous สุด
-    """
     sig = 1.0 / (1.0 + np.exp(raw_score))
     return float(np.clip((sig - SIG_MIN) / (SIG_MAX - SIG_MIN), 0.0, 1.0))
 
@@ -80,12 +70,11 @@ def score(
         raw = float(clf.score_samples([vec])[0])
 
     return {
-        "raw_score":  round(raw, 4),
+        "raw_score": round(raw, 4),
         "normalized": round(normalize(raw), 4),
     }
 
 
-# แปลง normalized score → action (LOW/MEDIUM/REVOKE) ใน engine
 RISK_MEDIUM_THRESHOLD = float(os.getenv("RISK_MEDIUM_THRESHOLD", "0.5"))
 RISK_REVOKE_THRESHOLD = float(os.getenv("RISK_REVOKE_THRESHOLD", "0.85"))
 
@@ -113,9 +102,9 @@ def decision(
         action = "low"
 
     return {
-        "action":      action,
-        "raw_score":   round(raw, 4),
-        "normalized":  round(normalized, 4),
+        "action": action,
+        "raw_score": round(raw, 4),
+        "normalized": round(normalized, 4),
         "thresholds": {
             "medium": RISK_MEDIUM_THRESHOLD,
             "revoke": RISK_REVOKE_THRESHOLD,
@@ -126,7 +115,7 @@ def decision(
 @app.get("/health")
 def health():
     return {
-        "status":  "ok",
+        "status": "ok",
         "sig_min": SIG_MIN,
         "sig_max": SIG_MAX,
     }
