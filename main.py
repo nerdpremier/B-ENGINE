@@ -1,18 +1,18 @@
 """
 Risk Engine — Isolation Forest scoring microservice
-Decision-centered normalization + rule-based auto-click boost.
+Raw-score pivot normalization + rule-based auto-click boost.
 
 แนวคิด:
 1) ใช้ Isolation Forest ให้คะแนนพฤติกรรมรวม
-2) ใช้ decision_function() เป็นแกน normalize เพราะ decision=0 คือเส้นแบ่ง anomaly ของโมเดล
-3) เพิ่ม rule-based detector สำหรับ auto click
-4) ถ้าเข้าเงื่อนไข auto click ให้ boost score ขึ้นทันที
+2) ใช้ score_samples() เป็นคะแนนดิบจากโมเดล
+3) normalize ด้วย pivot + power curve
+4) เพิ่ม rule-based detector สำหรับ auto click
+5) ถ้าเข้าเงื่อนไข auto click ให้ boost score ขึ้นทันที
 
 Output meaning:
 - raw_score   : คะแนนดิบจาก Isolation Forest
-- decision    : ค่าจาก decision_function()
-                > 0 = ปกติ, < 0 = ฝั่ง anomaly
-- base_score  : score ที่ normalize จาก decision อย่างเดียว
+- decision    : ค่าจาก decision_function() เก็บไว้ดูประกอบ
+- base_score  : score ที่ normalize จาก raw_score อย่างเดียว
 - normalized  : final score หลังรวม auto-click rule
 """
 
@@ -23,14 +23,17 @@ import numpy as np
 import warnings
 import os
 
-app = FastAPI(title="Risk Engine", version="4.0-decision-autoclick")
+app = FastAPI(title="Risk Engine", version="5.0-rawscore-pivot-autoclick")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_model.pkl")
 API_SECRET = os.getenv("RISK_API_SECRET", "change-me")
 
-# scale ยิ่งมาก = score นุ่มขึ้น
-# scale ยิ่งน้อย = score ชัน/ไวขึ้น
-RISK_SCALE = float(os.getenv("RISK_SCALE", "0.12"))
+# normalize config
+# pivot_ratio ยิ่งมาก = เริ่มมองว่าเสี่ยงเร็วขึ้น
+# anomaly_gamma ยิ่งมาก = ดันฝั่ง anomaly สูงขึ้นแรงกว่าเดิม
+PIVOT_RATIO = float(os.getenv("PIVOT_RATIO", "0.25"))
+ANOMALY_GAMMA = float(os.getenv("ANOMALY_GAMMA", "3.0"))
+
 EPS = 1e-12
 
 try:
@@ -90,26 +93,36 @@ def to_vector(b: BehaviorPayload) -> list[float]:
     return vec
 
 
-def normalize_from_decision(decision: float) -> float:
+def normalize_from_raw(raw_score: float) -> float:
     """
-    แปลง decision_function() เป็น risk score ในช่วง [0, 1]
+    แปลง score_samples() เป็น risk score ในช่วง [0, 1]
 
-    Isolation Forest:
-    - decision > 0  => ปกติ
-    - decision = 0  => เส้นแบ่งของโมเดล
-    - decision < 0  => ผิดปกติ
+    หลักการ:
+    - ใช้ pivot แทน train_min เพื่อให้ anomaly zone เริ่มเร็วขึ้น
+    - score >= pivot  -> ใช้ linear zone
+    - score < pivot   -> ใช้ power curve ดันคะแนนขึ้นเร็วขึ้น
 
-    ใช้ sigmoid กลับด้าน:
-        risk = 1 / (1 + exp(decision / scale))
-
-    ผลลัพธ์:
-    - decision บวกมาก  -> risk ใกล้ 0
-    - decision ใกล้ 0   -> risk ใกล้ 0.5
-    - decision ติดลบมาก -> risk ใกล้ 1
+    หมายเหตุ:
+    - score_samples() ของ IsolationForest:
+      ค่ายิ่งต่ำ = ยิ่งผิดปกติ
     """
-    scale = max(RISK_SCALE, EPS)
-    risk = 1.0 / (1.0 + np.exp(decision / scale))
-    return float(np.clip(risk, 0.0, 1.0))
+    train_range = max(TRAIN_SCORE_RANGE, EPS)
+    pivot = TRAIN_SCORE_MIN + (train_range * PIVOT_RATIO)
+
+    # กันหาร 0
+    denom = max(TRAIN_SCORE_MAX - pivot, EPS)
+
+    # ฝั่งที่ยังถือว่าปกติ / ยังไม่หนักมาก
+    if raw_score >= pivot:
+        value = 0.5 * (TRAIN_SCORE_MAX - raw_score) / denom
+
+    # ฝั่ง anomaly
+    else:
+        excess = (pivot - raw_score) / train_range
+        boosted = np.power(excess, 1.0 / max(ANOMALY_GAMMA, EPS))
+        value = 0.5 + 0.5 * boosted
+
+    return float(np.clip(value, 0.0, 1.0))
 
 
 def detect_auto_click_rule(b: BehaviorPayload) -> dict:
@@ -186,7 +199,7 @@ def combine_scores(base_score: float, auto_click: dict) -> float:
 
         # ถ้ารุนแรงมาก ดันขั้นต่ำขึ้นเลย
         if severity >= 0.60:
-            final_score = max(final_score, 1)
+            final_score = max(final_score, 1.0)
         elif severity >= 0.35:
             final_score = max(final_score, 0.9)
 
@@ -208,7 +221,7 @@ def score(
         raw = float(clf.score_samples([vec])[0])
         decision = float(clf.decision_function([vec])[0])
 
-    base_score = normalize_from_decision(decision)
+    base_score = normalize_from_raw(raw)
     auto_click = detect_auto_click_rule(payload)
     final_score = combine_scores(base_score, auto_click)
 
@@ -217,7 +230,8 @@ def score(
         "decision": round(decision, 6),
         "base_score": round(base_score, 6),
         "normalized": round(final_score, 6),
-        "risk_scale": RISK_SCALE,
+        "pivot_ratio": PIVOT_RATIO,
+        "anomaly_gamma": ANOMALY_GAMMA,
         "auto_click_detected": auto_click["detected"],
         "auto_click_severity": auto_click["severity"],
         "auto_click_reasons": auto_click["reasons"],
@@ -235,7 +249,8 @@ def health():
         "train_score_max": round(TRAIN_SCORE_MAX, 6),
         "train_score_range": round(TRAIN_SCORE_RANGE, 6),
         "model_offset": None if np.isnan(MODEL_OFFSET) else round(MODEL_OFFSET, 6),
-        "risk_scale": RISK_SCALE,
-        "normalization_mode": "decision_sigmoid_centered_at_zero",
+        "pivot_ratio": PIVOT_RATIO,
+        "anomaly_gamma": ANOMALY_GAMMA,
+        "normalization_mode": "raw_score_pivot_power_curve",
         "rule_engine": "auto_click_boost_enabled",
     }
