@@ -12,7 +12,7 @@ MODEL_PATH = os.getenv("MODEL_PATH", "isolation_forest_model.pkl")
 API_SECRET = os.getenv("RISK_API_SECRET", "change-me")
 
 PIVOT_RATIO = float(os.getenv("PIVOT_RATIO", "0.10"))
-ANOMALY_GAMMA = float(os.getenv("ANOMALY_GAMMA", "2.0"))
+ANOMALY_GAMMA = float(os.getenv("ANOMALY_GAMMA", "2.5"))
 
 EPS = 1e-12
 
